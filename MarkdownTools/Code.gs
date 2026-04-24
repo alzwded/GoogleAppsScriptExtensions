@@ -32,6 +32,7 @@ function onOpen() {
   DocumentApp.getUi()
     .createMenu('Markdown Tools')
     .addItem('Format Selected Markdown', 'processSelectedMarkdown')
+    .addItem('Markdownify Formatted Selection', 'markdownifySelectedText')
     .addToUi();
 }
 
@@ -110,10 +111,264 @@ function processSelectedMarkdown() {
 }
 
 /**
+ * REVERSE ENGINE: Converts selected Google Docs elements into Markdown
+ */
+function markdownifySelectedText() {
+  const doc = DocumentApp.getActiveDocument();
+  const selection = doc.getSelection();
+  
+  if (!selection) {
+    DocumentApp.getUi().alert('Please highlight the text you want to Markdownify.');
+    return;
+  }
+
+  const body = doc.getBody();
+  const rangeElements = selection.getRangeElements();
+  let insertIndex = -1;
+  const elementsToProcess = [];
+
+  // Phase 1: Identify full blocks involved in the selection
+  const processedIndices = new Set(); // Track unique element indices
+
+  for (let i = 0; i < rangeElements.length; i++) {
+    const rangeEl = rangeElements[i];
+    let topLevel = rangeEl.getElement();
+
+    // Bubble up to find the direct child of the Body
+    while (topLevel.getParent() && topLevel.getParent().getType() !== DocumentApp.ElementType.BODY_SECTION) {
+      topLevel = topLevel.getParent();
+    }
+
+    const childIndex = body.getChildIndex(topLevel);
+
+    if (insertIndex === -1) {
+      insertIndex = childIndex;
+    }
+
+    // Deduplicate using the child index instead of the object reference
+    if (!processedIndices.has(childIndex)) {
+      console.log("Adding element to process:", topLevel.getType().toString(), "with text:", topLevel.getText ? topLevel.getText().substr(0, 40) : "[no text]");
+      
+      processedIndices.add(childIndex);
+      elementsToProcess.push(topLevel);
+    }
+  }
+
+  // Phase 2: Traverse elements and generate Markdown strings
+  let mdLines = [];
+  let footnotes = [];
+  let inCodeFence = false;
+
+  elementsToProcess.forEach(el => {
+    const type = el.getType();
+    console.log("Processing element type:", type.toString(), "with text:", el.getText ? el.getText().substr(0, 40) : "[no text]");
+
+    // Handle Code Fences
+    if (type === DocumentApp.ElementType.PARAGRAPH && isMonospaceBlock(el)) {
+      if (!inCodeFence) {
+        mdLines.push('```');
+        inCodeFence = true;
+      }
+      mdLines.push(el.getText()); // Raw text, no inline markdown processing
+      return;
+    } else {
+      if (inCodeFence) {
+        mdLines.push('```');
+        inCodeFence = false;
+      }
+    }
+
+    // Process different block types
+    if (type === DocumentApp.ElementType.PARAGRAPH) {
+      const headingMap = {
+        [DocumentApp.ParagraphHeading.HEADING1]: '# ',
+        [DocumentApp.ParagraphHeading.HEADING2]: '## ',
+        [DocumentApp.ParagraphHeading.HEADING3]: '### ',
+        [DocumentApp.ParagraphHeading.HEADING4]: '#### ',
+        [DocumentApp.ParagraphHeading.HEADING5]: '##### ',
+        [DocumentApp.ParagraphHeading.HEADING6]: '###### '
+      };
+      const prefix = headingMap[el.getHeading()] || '';
+      const text = extractMarkdownFromContainer(el, footnotes);
+      if (text.trim() !== '' || prefix !== '') {
+        mdLines.push(prefix + text);
+      } else {
+        mdLines.push('');
+      }
+    } 
+    else if (type === DocumentApp.ElementType.LIST_ITEM) {
+      const indent = '  '.repeat(el.getNestingLevel());
+      const orderedGlyphs = [
+        DocumentApp.GlyphType.NUMBER,
+        DocumentApp.GlyphType.LATIN_LOWER,
+        DocumentApp.GlyphType.LATIN_UPPER,
+        DocumentApp.GlyphType.ROMAN_LOWER,
+        DocumentApp.GlyphType.ROMAN_UPPER
+      ];
+      const unorderedChars = [
+        '-',
+        '+',
+        '*'
+      ];
+      const isOrdered = orderedGlyphs.includes(el.getGlyphType());
+      const prefix = isOrdered ? '1. ' : `${unorderedChars[el.getNestingLevel() % unorderedChars.length]} `;
+      mdLines.push(indent + prefix + extractMarkdownFromContainer(el, footnotes));
+    } 
+    else if (type === DocumentApp.ElementType.TABLE) {
+      console.log("Processing table with", el.getNumRows(), "rows");
+      for (let r = 0; r < el.getNumRows(); r++) {
+        const row = el.getRow(r);
+        console.log("Processing row", r, "with", row.getNumCells(), "cells");
+        let rowData = [];
+        for (let c = 0; c < row.getNumCells(); c++) {
+          console.log("Processing cell", c);
+          let cell = row.getCell(c);
+          let cellMdLines = [];
+          for (let p = 0; p < cell.getNumChildren(); p++) {
+             cellMdLines.push(extractMarkdownFromContainer(cell.getChild(p), footnotes));
+          }
+          console.log("Add row", r, "cell", c, "content:", cellMdLines.join(' | '));
+          // Flatten multi-paragraph cells to `<br>` for markdown tables
+          rowData.push(cellMdLines.join('<br>')); 
+        }
+        mdLines.push('| ' + rowData.join(' | ') + ' |');
+        
+        // Add table header separator
+        if (r === 0) {
+          mdLines.push('|' + rowData.map(() => '---').join('|') + '|');
+        }
+      }
+    }
+  });
+
+  if (inCodeFence) mdLines.push('```');
+
+  // Append Footnotes
+  if (footnotes.length > 0) {
+    mdLines.push('');
+    footnotes.forEach((note, index) => {
+      mdLines.push(`[^${index + 1}]: ${note}`);
+    });
+  }
+
+  // Phase 3: Insert raw text and remove original objects
+  const finalMarkdown = mdLines.join('\n');
+  body.insertParagraph(insertIndex, finalMarkdown);
+
+  elementsToProcess.forEach(el => {
+    try {
+      el.removeFromParent();
+    } catch(e) {
+      if (el.getType() === DocumentApp.ElementType.PARAGRAPH) {
+        el.clear();
+      }
+    }
+  });
+}
+
+/**
+ * Extracts inner contents and transforms inline Google Docs styles to Markdown
+ */
+function extractMarkdownFromContainer(container, footnotes) {
+  let mdText = '';
+  // Check if standard container with children
+  if (typeof container.getNumChildren !== 'function') return container.getText();
+
+  for (let i = 0; i < container.getNumChildren(); i++) {
+    const child = container.getChild(i);
+    const type = child.getType();
+
+    if (type === DocumentApp.ElementType.TEXT) {
+      mdText += processTextRun(child);
+    } else if (type === DocumentApp.ElementType.FOOTNOTE) {
+      const fnContents = child.getFootnoteContents().getText().trim();
+      footnotes.push(fnContents);
+      mdText += `[^${footnotes.length}]`;
+    } else {
+      // Best effort for unhandled inline items (like equations)
+      if (child.getText) mdText += child.getText();
+    }
+  }
+  return mdText;
+}
+
+/**
+ * Helper to extract and format attributes in an inline Text Element
+ */
+function processTextRun(textEl) {
+  const rawText = textEl.getText();
+  if (!rawText) return '';
+  
+  const indices = textEl.getTextAttributeIndices();
+  let mdStr = '';
+
+  for (let i = 0; i < indices.length; i++) {
+    const start = indices[i];
+    const end = i + 1 < indices.length ? indices[i + 1] - 1 : rawText.length - 1;
+    let seg = rawText.substring(start, end + 1);
+
+    // Pull out whitespace to prevent markdown syntax breaking, e.g., "** bold **"
+    const leadingSpace = seg.match(/^\s*/)[0];
+    const trailingSpace = seg.match(/\s*$/)[0];
+    let coreSeg = seg.trim();
+
+    if (!coreSeg) {
+      mdStr += seg; 
+      continue;
+    }
+
+    const font = textEl.getFontFamily(start);
+    const isCode = ['Courier New', 'Consolas', 'Monaco', 'monospace'].includes(font);
+    const isBold = textEl.isBold(start);
+    const isItalic = textEl.isItalic(start);
+    const isUnderline = textEl.isUnderline(start);
+    const linkUrl = textEl.getLinkUrl(start);
+
+    // Apply inline syntax (inside out)
+    if (isCode) coreSeg = `\`${coreSeg}\``;
+    if (isItalic) coreSeg = `*${coreSeg}*`;
+    if (isBold) coreSeg = `**${coreSeg}**`;
+    if (isUnderline) coreSeg = `<u>${coreSeg}</u>`;
+    if (linkUrl) coreSeg = `[${coreSeg}](${linkUrl})`;
+
+    mdStr += leadingSpace + coreSeg + trailingSpace;
+  }
+  
+  return mdStr;
+}
+
+/**
+ * Helper: Detects if an entire paragraph is uniformly styled as monospace.
+ */
+function isMonospaceBlock(container) {
+  if (container.getType() !== DocumentApp.ElementType.PARAGRAPH) return false;
+  if (container.getNumChildren() === 0) return false;
+  
+  let hasText = false;
+  for (let i = 0; i < container.getNumChildren(); i++) {
+    const child = container.getChild(i);
+    if (child.getType() === DocumentApp.ElementType.TEXT) {
+      hasText = true;
+      const font = child.getFontFamily(0);
+      if (!['Courier New', 'Consolas', 'Monaco', 'monospace'].includes(font)) {
+        return false;
+      }
+    } else if (child.getType() !== DocumentApp.ElementType.FOOTNOTE) {
+      return false; // Inline images, etc., break the "pure block" assumption
+    }
+  }
+  return hasText;
+}
+
+// ---------------------------------------------------------
+// ORIGINAL PARSING FUNCTIONS BELOW
+// ---------------------------------------------------------
+
+/**
  * Reads lines and categorizes them into block-level elements.
  */
 function parseBlocks(rawText) {
-  const lines = rawText.split('\n');
+  const lines = rawText.replaceAll('\r\n', '\n').replaceAll('\r', '\n').split('\n');
   const blocks = [];
   const footnotes = {};
   
@@ -164,13 +419,16 @@ function parseBlocks(rawText) {
     // 4. Tables
     {
       const prev = blocks[blocks.length - 1];
-      if (line.trim().startsWith('|') && (line.trim().endsWith('|') || prev && prev.type === 'table')) {
+      if (line.trim().startsWith('|') && (line.trim().endsWith('|') || (prev && prev.type === 'table'))) {
         const rowData = line.split('|').slice(1, line.trim().endsWith('|') ? -1 : undefined).map(c => c.trim());
         if (rowData.every(c => /^[-:]+$/.test(c))) continue; 
 
         if (prev && prev.type === 'table') {
+          console.log("Appending row to existing table:", rowData);
           prev.rows.push(rowData);
         } else {
+          console.log("starting table", rowData);
+          console.log("line:", `{{${line}}}`, line.split('').map(c => c.charCodeAt(0)));
           blocks.push({ type: 'table', rows: [rowData] });
         }
         continue;
@@ -379,4 +637,3 @@ function processFootnotes(doc, textElement, footnotesMap) {
     found = textElement.findText(fnRegex);
   }
 }
-

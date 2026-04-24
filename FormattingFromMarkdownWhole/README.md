@@ -1,3 +1,7 @@
+Deprecated in favour of a more granular [version](../MarkdownTools/README.md) with roundtripping.
+
+---
+
 While I know you can render Markdown to some Rich Text variant and paste that into Gdocs and it will look right...
 
 ...why not write a GAS?
