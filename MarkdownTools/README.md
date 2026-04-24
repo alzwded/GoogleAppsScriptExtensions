@@ -15,6 +15,8 @@ Supports vanilla markdown, including:
 
 The one obvious missing feature would be image blocks. Those get left alone.
 
+*Selection* is a funny term. It doesn't exactly snap to the precise character the cursor is at, rather, it uses it as guidance as to which paragraphs/objects to transform into blocks of markdown. I.e. it snaps to the extents of a paragraph, or of a table, or of a list, you cannot "format from markdown" a single instance of `**bolded text**`, it has to be a whole block.
+
 Installation
 ------------
 
